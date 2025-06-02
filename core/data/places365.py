@@ -116,6 +116,31 @@ class Places(Dataset):
         segmentation = image
         seg_path = img_path
 
+        # ==== 新增：獲取文字提示 ====
+        text_prompt = "an image" # 預設提示，以防提取失敗
+        try:
+            # 從 img_path 提取類別名
+            # 假設您的 dataroot 是 /home/carlos11/.../dataset/
+            # 且 img_path 是 /home/carlos11/.../dataset/football_field/xxxx.jpg
+            # 那麼 relative_path 將是 football_field/xxxx.jpg
+            relative_path = os.path.relpath(img_path, self.dataroot)
+            # category_name 將是 football_field
+            category_name = relative_path.split(os.sep)[0] 
+            text_prompt = category_name.replace("_", " ") # 將 "football_field" 轉換為 "football field"
+        except Exception as e:
+            # 如果您的 dataroot 直接就是 football_field 文件夾，上面的邏輯會出錯
+            # 因為 relative_path 就直接是 xxxx.jpg, split後取第一個就是文件名
+            # 這種情況下，您可以直接硬編碼，或者從 name 變數想辦法
+            # 例如，如果您的 dataroot 直接指向 /home/carlos11/.../dataset/football_field/
+            # 那麼可以簡單地：
+            if "football_field" in self.dataroot: # 簡單判斷
+                 text_prompt = "football field"
+            else:
+                 print(f"Warning: Could not reliably extract category name for {img_path} from dataroot '{self.dataroot}'. Using default prompt. Error: {e}")
+                 # 或者，如果 name 變數包含類別信息，嘗試從 name 提取
+                 # if 'football_field' in name.lower():
+                 #    text_prompt = "football field"
+                 
         example = {"image": image,
                    "segmentation": segmentation,
                    "img_path": img_path,
