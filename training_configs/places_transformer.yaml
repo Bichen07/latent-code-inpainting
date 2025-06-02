@@ -1,22 +1,29 @@
+############################################################
+#    Transformer  +  VQGAN  +  CSV-based Text-Image data   #
+############################################################
+
 model:
   base_learning_rate: 4.5e-06
   target: core.models.transformer.Transformer
   params:
-    # ckpt_path: ckpts/places256_transformer.ckpt
-    cond_stage_key: segmentation
+    # ---------- 關鍵修改 ----------
+    cond_stage_key: depth          # Dataset 提供 "depth"，用它當條件
     attention_extent: mask
-    mask_on_latent: true # set this to true during training only 
+    mask_on_latent: true           # 訓練時才開
+    # --------------------------------
+
     transformer_config:
       target: core.modules.transformer.mingpt.GPT
       params:
-        vocab_size: 1025
-        block_size: 257  # 257
-        n_layer: 40 # 24,40
+        vocab_size: 1025           # 1024 codebook + 1 MASK
+        block_size: 257            # 1(depth) + 256(image codes)
+        n_layer: 40
         n_head: 16
         n_embd: 1408
         embd_pdrop: 0.1
         resid_pdrop: 0.1
         attn_pdrop: 0.1
+
     first_stage_config:
       target: core.models.vqgan.VQModel
       params:
@@ -31,32 +38,34 @@ model:
           in_channels: 3
           out_ch: 3
           ch: 128
-          ch_mult:
-          - 1
-          - 1
-          - 2
-          - 2
-          - 4
+          ch_mult: [1, 1, 2, 2, 4]
           num_res_blocks: 2
-          attn_resolutions:
-          - 16
+          attn_resolutions: [16]
           dropout: 0.0
         lossconfig:
           target: core.modules.losses.DummyLoss
+
+    # 文字由 transformer.py 內的 encode_text() 處理，維持 uncond
     cond_stage_config: "__is_unconditional__"
 
+# --------------------------- DATA --------------------------- #
 data:
   target: train.DataModuleFromConfig
   params:
     batch_size: 12
+
+    # ------------  Train set：自訂 CSV dataset ------------ #
     train:
-      target: core.data.places365.Places
+      target: core.data.csv_text_image_dataset.CsvTextImageDataset
       params:
-        dataroot: /home/chenh/data/data_large
-        crop_size: 256
-        rescale: True
-        rescale_size: 256
-        split: 'train'
+        csv_file: "/mnt/data/annotations/football_annotations_v1.csv"
+        root:     "/mnt/data/football_dataset"   # 所有影像/深度的根目錄
+        img_col:  "image_path"
+        depth_col: "depth_path"                  # CSV 欄名；沒有就設 null
+        text_col:  "text"
+        img_size: 256
+
+    # ------------  Test／Val 仍沿用舊 Places365 ------------ #
     test:
       target: core.data.places365.Places
       params:
