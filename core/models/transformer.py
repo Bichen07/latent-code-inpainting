@@ -13,6 +13,8 @@ def disabled_train(self, mode=True):
     does not change anymore."""
     return self
 
+#### import clip
+import clip
 
 class Transformer(pl.LightningModule):
     def __init__(self,
@@ -36,6 +38,8 @@ class Transformer(pl.LightningModule):
                  sos_token=0,
                  unconditional=False,
                  attention_extent='mask',
+                 #### text token
+                 text_token="None"
                  ):
         super().__init__()
         self.be_unconditional = unconditional
@@ -77,6 +81,12 @@ class Transformer(pl.LightningModule):
 
         # todo: remove hard-coded mapping
         self.mask_function = self.scatter_mask
+
+        #### clip initialize
+        self.text_token = text_token
+        if text_token != "None":
+            self.clip_model, _ = clip.load("Vit-B/32", device=self.device)
+            self.clip_model.eval()
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -179,6 +189,14 @@ class Transformer(pl.LightningModule):
             assert len(mask.shape) == 2 and mask.shape[-1] == z_indices.shape[-1]
         mask = mask.to(dtype=torch.int64)
         return mask
+  
+    #### text encoder
+    @torch.no_grad()
+    def encode_text(self, text_list):
+        tokens = clip.tokenize(text_list).to(self.device)
+        text_features = self.clip_model.encode_text(tokens)
+        text_tokens = text_features.unsqueeze(1).repeat(1, self.transformer.block_size // 8, 1)
+        return text_tokens
 
     def forward(self, x, c, mask=None):
         # one step to produce the logits
@@ -203,6 +221,15 @@ class Transformer(pl.LightningModule):
         cz_indices = torch.cat((c_indices, a_indices), dim=1)
         mask_c_indices = torch.full_like(c_indices, 1, dtype=torch.int64).to(mask.device)
         mask_c = torch.cat([mask_c_indices, mask], dim=1)
+
+        #### text condition
+        if self.text_token != "None":
+            B = x.shape[0]
+            text_prompt = [self.text_token] * B
+            text_emb = self.encode_text(text_prompt)
+            cz_indices = torch.cat((text_emb, cz_indices), dim=1)
+            mask_text = torch.ones(text_emb.shape[:2], dtype=torch.int64).to(mask.device)
+            mask_c = torch.cat([mask_text, mask_c], dim=1)
 
         if self.attention_extent == 'mask':
             logits, _ = self.transformer(cz_indices, mask=mask_c, autoregressive=False)
