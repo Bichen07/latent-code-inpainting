@@ -166,22 +166,26 @@ class GPT(nn.Module):
             module.weight.data.fill_(1.0)
 
     def forward(self, idx, embeddings=None, targets=None, mask=None, autoregressive=True):
-        # forward the GPT model
-        token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
-        if embeddings is not None: # prepend explicit embeddings
-            token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
+        token_embeddings = self.tok_emb(idx)  # shape = (B, T, D)
 
-        t = token_embeddings.shape[1]
-        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
-        position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
+        if text_emb is not None:
+            # text_emb: (B, T_text, D)
+            token_embeddings = torch.cat([text_emb, token_embeddings], dim=1)
 
-        x = self.drop(token_embeddings + position_embeddings)
-        for idx, block in enumerate(self.blocks):
-            # if idx <= len(self.blocks) // 2:
+        total_len = token_embeddings.size(1)
+        assert total_len <= self.block_size, f"sequence length {total_len} > block size {self.block_size}"
+
+        position_embeddings = self.pos_emb[:, :total_len, :]  # (1, total_len, D)
+        x = self.drop(token_embeddings + position_embeddings)  # (B, total_len, D)
+
+        for block in self.blocks:
             x = block(x, autoregressive=autoregressive, mask=mask)
 
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.head(x)  # shape = (B, total_len, vocab_size)
+
+        if text_emb is not None:
+            logits = logits[:, text_emb.size(1):, :]
 
         # if we are given some desired targets also calculate the loss
         loss = None
