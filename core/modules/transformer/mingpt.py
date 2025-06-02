@@ -18,12 +18,73 @@ from transformers import top_k_top_p_filtering
 
 logger = logging.getLogger(__name__)
 
+# ==== [新增] CrossAttention 模塊 ====
+class CrossAttention(nn.Module):
+    """
+    A vanilla multi-head cross-attention layer.
+    Query: from visual features
+    Key, Value: from text features (context)
+    """
+    def __init__(self, config, context_dim=None): # 新增 context_dim 參數
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in separate layers
+        self.query = nn.Linear(config.n_embd, config.n_embd) # Query from visual stream
+
+        # context_dim 通常是文字 embedding 的維度，例如 CLIP 的 512 或 768
+        # 如果沒有提供 context_dim，則假設它與 n_embd 相同 (不推薦，但作為回退)
+        self.key_dim = context_dim if context_dim is not None else config.n_embd
+        self.value_dim = context_dim if context_dim is not None else config.n_embd
+
+        self.key = nn.Linear(self.key_dim, config.n_embd)     # Key from text context
+        self.value = nn.Linear(self.value_dim, config.n_embd)   # Value from text context
+        
+        # regularization
+        self.attn_drop = nn.Dropout(config.attn_pdrop)
+        self.resid_drop = nn.Dropout(config.resid_pdrop)
+        # output projection
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x, context):
+        """
+        x: visual features (Query), shape (B, T_vis, C_vis) where C_vis = n_embd
+        context: text features (Key, Value source), shape (B, T_txt, C_txt) where C_txt = context_dim
+        """
+        B_x, T_x, C_x = x.size()
+        B_c, T_c, C_c = context.size()
+
+        assert C_x == self.n_embd, f"Visual embedding dim {C_x} doesn't match n_embd {self.n_embd}"
+        assert C_c == self.key_dim, f"Context embedding dim {C_c} doesn't match context_dim {self.key_dim}"
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q = self.query(x).view(B_x, T_x, self.n_head, C_x // self.n_head).transpose(1, 2)  # (B_x, nh, T_x, hs)
+        k = self.key(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
+        v = self.value(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
+
+        # cross-attention; (B_x, nh, T_x, hs) x (B_c, nh, hs, T_c) -> (B_x, nh, T_x, T_c)
+        # (B_c should be same as B_x for batch processing)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v  # (B_x, nh, T_x, T_c) x (B_c, nh, T_c, hs) -> (B_x, nh, T_x, hs)
+        y = y.transpose(1, 2).contiguous().view(B_x, T_x, C_x) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_drop(self.proj(y))
+        return y
+# =============================
 
 class GPTConfig:
     """ base GPT config, params common to all GPT versions """
     embd_pdrop = 0.1
     resid_pdrop = 0.1
     attn_pdrop = 0.1
+    # ==== [新增] context_dim 預設值 ====
+    context_dim = None # Dimension of the external context (e.g., text embedding)
+    # =================================
 
     def __init__(self, vocab_size, block_size, **kwargs):
         self.vocab_size = vocab_size
@@ -110,6 +171,15 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
+
+        # ==== [新增] Cross-Attention 層及其 LayerNorm ====
+        self.ln_cross_attn_q = nn.LayerNorm(config.n_embd) # LayerNorm for the query (visual features)
+        # 假設 context_dim 也是 config 的一部分，或者 GPT 類會傳遞它
+        # 為了更清晰，我們讓 GPTConfig 包含 context_dim
+        self.cross_attn = CrossAttention(config, context_dim=config.context_dim if hasattr(config, 'context_dim') else None)
+        # ==============================================
+
+
         self.mlp = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd),
             nn.GELU(),  # nice
@@ -117,13 +187,27 @@ class Block(nn.Module):
             nn.Dropout(config.resid_pdrop),
         )
 
-    def forward(self, x, autoregressive=True, layer_past=None, return_present=False, mask=None):
-        # TODO: check that training still works
-        if return_present: assert not self.training
-        # layer past: tuple of length two with B, nh, T, hs
-        attn, present = self.attn(self.ln1(x), autoregressive=autoregressive, layer_past=layer_past, mask=mask)
+    # <--- [修改] forward 方法增加 context 參數 ----
+    def forward(self, x, context=None, autoregressive=True, layer_past=None, return_present=False, mask=None): 
+        # x: visual features
+        # context: text features (semantic context)
 
-        x = x + attn
+        # Self-Attention part (remains mostly the same)
+        # TODO: check that training still works (原始 TODO)
+        if return_present: assert not self.training # 原始斷言
+        # layer past: tuple of length two with B, nh, T, hs (原始註釋)
+        
+        # --- Self-Attention for visual features ---
+        attn_out, present = self.attn(self.ln1(x), autoregressive=autoregressive, layer_past=layer_past, mask=mask)
+        x = x + attn_out # Residual connection
+
+        # ==== [新增] Cross-Attention Part (if context is provided) ====
+        if context is not None:
+            # Visual features (x) attend to text features (context)
+            cross_attn_out = self.cross_attn(self.ln_cross_attn_q(x), context)
+            x = x + cross_attn_out # Residual connection
+        # ===========================================================
+
         x = x + self.mlp(self.ln2(x))
         if layer_past is not None or return_present:
             return x, present
@@ -132,8 +216,10 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
+    # <--- [修改] __init__ 參數列表，增加 context_dim ----
     def __init__(self, vocab_size, block_size, n_layer=12, n_head=8, n_embd=256,
-                 embd_pdrop=0., resid_pdrop=0., attn_pdrop=0., n_unmasked=0):
+                 embd_pdrop=0., resid_pdrop=0., attn_pdrop=0., n_unmasked=0, 
+                 context_dim=None): # <--- [新增] context_dim 參數
         super().__init__()
         config = GPTConfig(vocab_size=vocab_size, block_size=block_size,
                            embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop, attn_pdrop=attn_pdrop,
@@ -165,10 +251,39 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, idx, embeddings=None, targets=None, mask=None, autoregressive=True):
-        # forward the GPT model
+    # def forward(self, idx, embeddings=None, targets=None, mask=None, autoregressive=True):
+    #     # forward the GPT model
+    #     token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
+    #     if embeddings is not None: # prepend explicit embeddings
+    #         token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
+
+    #     t = token_embeddings.shape[1]
+    #     assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+    #     position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
+
+    #     x = self.drop(token_embeddings + position_embeddings)
+    #     for idx, block in enumerate(self.blocks):
+    #         # if idx <= len(self.blocks) // 2:
+    #         x = block(x, autoregressive=autoregressive, mask=mask)
+
+    #     x = self.ln_f(x)
+    #     logits = self.head(x)
+
+    #     # if we are given some desired targets also calculate the loss
+    #     loss = None
+    #     if targets is not None:
+    #         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+    #     return logits, loss
+
+    # <--- [修改] forward 方法增加 context 參數 ----
+    def forward(self, idx, context=None, embeddings=None, targets=None, mask=None, autoregressive=True):
+        # idx: visual token indices
+        # context: text features (semantic context)
+        
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
-        if embeddings is not None: # prepend explicit embeddings
+        if embeddings is not None: # prepend explicit embeddings (原始邏輯，可能與我們的用法衝突或需要調整)
+                                   # 我們這裡的 context 是給 Cross-Attention 用的，不是直接拼接到 token_embeddings
             token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
 
         t = token_embeddings.shape[1]
@@ -176,14 +291,13 @@ class GPT(nn.Module):
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
 
         x = self.drop(token_embeddings + position_embeddings)
-        for idx, block in enumerate(self.blocks):
-            # if idx <= len(self.blocks) // 2:
-            x = block(x, autoregressive=autoregressive, mask=mask)
+        for block_idx, block in enumerate(self.blocks): # 使用 block_idx 以便調試
+            # <--- [修改] 將 context 傳遞給每個 block ----
+            x = block(x, context=context, autoregressive=autoregressive, mask=mask)
 
         x = self.ln_f(x)
         logits = self.head(x)
 
-        # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))

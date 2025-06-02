@@ -6,6 +6,7 @@ import pytorch_lightning as pl
 import random
 from train import instantiate_from_config
 from core.modules.util import SOSProvider, scatter_mask, box_mask, mixed_mask, RandomMask, BatchRandomMask
+import clip # <--- [新增] 導入 clip
 
 
 def disabled_train(self, mode=True):
@@ -20,6 +21,9 @@ class Transformer(pl.LightningModule):
                  cond_stage_config,
                  first_stage_config=None,
                  refinement_stage_config=None,
+                 # ==== [新增] 可以考慮增加參數來控制 CLIP 模型類型 ====
+                 clip_model_name="ViT-B/32", # 預設的 CLIP 模型
+                 # ===================================================
                  permuter_config=None,
                  ckpt_path=None,
                  ignore_keys=[],
@@ -53,10 +57,60 @@ class Transformer(pl.LightningModule):
         self.cond_stage_key = cond_stage_key
         self.first_stage_model = None
         self.second_stage_model = None
+        self.pkeep = pkeep
 
         if permuter_config is None:
             permuter_config = {"target": "core.modules.transformer.permuter.Identity"}            
         self.permuter = instantiate_from_config(config=permuter_config)
+
+        # ==== [新增] 初始化 CLIP Text Encoder ====
+        self.clip_model = None
+        self.text_embedding_dim = None # 先設為 None
+        try:
+            print(f"Loading CLIP model: {clip_model_name}...")
+            # 我們需要將模型移動到 self.device，但此時 self.device 可能還未定義
+            # PyTorch Lightning 會自動處理模型到設備的移動，所以先載入到 CPU
+            self.clip_model, _ = clip.load(clip_model_name, device="cpu") 
+            self.clip_model.requires_grad_(False) # 凍結 CLIP 參數
+            self.clip_model.eval()
+            # 獲取 CLIP text embedding 的維度
+            # 這取決於具體的 CLIP 模型，對於 ViT-B/32 是 512
+            # 可以通過 model.text_projection (如果存在) 或 model.ln_final (視覺部分) 的權重形狀推斷
+            # 或者直接使用已知值。一個通用的獲取方式是執行一次 encode_text
+            dummy_text = clip.tokenize(["test"]).to("cpu")
+            with torch.no_grad():
+                dummy_embedding = self.clip_model.encode_text(dummy_text)
+            self.text_embedding_dim = dummy_embedding.shape[-1]
+            print(f"CLIP model '{clip_model_name}' loaded. Text embedding dimension: {self.text_embedding_dim}")
+        except Exception as e:
+            print(f"Could not load CLIP model '{clip_model_name}': {e}. Text conditioning will be effectively disabled.")
+        # =====================================
+
+        # ==== [修改] 實例化 mingpt.GPT 時傳入 context_dim ====
+        # 我們需要將 text_embedding_dim 作為 context_dim 傳給 mingpt.GPT
+        # 這需要在 transformer_config 的 params 中加入 context_dim
+        # 如果 YAML 中已經配置了 context_dim，這裡會使用 YAML 中的值
+        # 如果 YAML 中沒有，我們會嘗試使用 self.text_embedding_dim
+        
+        # 確保 transformer_config.params 存在
+        if "params" not in transformer_config:
+            transformer_config["params"] = {}
+        
+        # 如果 YAML 中沒有定義 context_dim，並且我們成功加載了 CLIP，則使用 CLIP 的維度
+        if self.clip_model is not None and "context_dim" not in transformer_config["params"]:
+            transformer_config["params"]["context_dim"] = self.text_embedding_dim
+            print(f"Setting mingpt.GPT context_dim to {self.text_embedding_dim} from CLIP model.")
+        elif "context_dim" in transformer_config["params"]:
+            print(f"Using context_dim from YAML: {transformer_config['params']['context_dim']}")
+            if self.clip_model is not None and self.text_embedding_dim != transformer_config['params']['context_dim']:
+                print(f"Warning: CLIP text_embedding_dim ({self.text_embedding_dim}) " +
+                      f"does not match context_dim in YAML ({transformer_config['params']['context_dim']}). " +
+                      "Ensure this is intended.")
+        else: # clip_model is None and context_dim not in YAML
+             print("Warning: CLIP model not loaded and context_dim not specified in YAML. Cross-Attention in GPT might not work as expected.")
+             # 即使如此，我們仍然可以給 GPT 傳遞一個 context_dim=None，讓它退化到沒有 Cross-Attention
+             transformer_config["params"]["context_dim"] = None
+        # =====================================
 
         self.transformer = instantiate_from_config(config=transformer_config)
         self.use_condGPT = self.transformer.__class__.__name__ == 'CondGPT'
@@ -76,7 +130,48 @@ class Transformer(pl.LightningModule):
         self.pkeep = pkeep
 
         # todo: remove hard-coded mapping
-        self.mask_function = self.scatter_mask
+        # self.mask_function = self.scatter_mask
+        if mask_function == "random_mask":
+            # BatchRandomMask(batch_size, s, hole_range=[min_hole_ratio, max_hole_ratio])
+            # p_from_scheduler 就是洞的比例 (hole_ratio)
+            self.mask_function_impl = lambda z_indices, p_hole_ratio: torch.from_numpy(
+                BatchRandomMask(
+                    batch_size=z_indices.shape[0],
+                    s=int(math.sqrt(z_indices.shape[-1])),
+                    hole_range=[p_hole_ratio, p_hole_ratio] 
+                )
+            ).to(z_indices.device).long()
+            self._mask_function_name_for_log = "BatchRandomMask (from core.modules.util)"
+
+        elif mask_function == "box_mask":
+            # self.box_mask(shape, device, p_keep_ratio)
+            # p_hole_ratio 是遮蔽比例，所以 p_keep_ratio = 1.0 - p_hole_ratio
+            self.mask_function_impl = lambda z_indices, p_hole_ratio: self.box_mask(
+                                            shape=z_indices.shape,
+                                            device=z_indices.device,
+                                            p=(1.0 - p_hole_ratio) # p 參數是保留比例
+                                        )
+            self._mask_function_name_for_log = "box_mask (Transformer class method)"
+
+        elif mask_function == "scatter_mask":
+            # self.scatter_mask(shape, device, p_keep_ratio)
+            self.mask_function_impl = lambda z_indices, p_hole_ratio: self.scatter_mask(
+                                            shape=z_indices.shape,
+                                            device=z_indices.device,
+                                            p=(1.0 - p_hole_ratio) # p 參數是保留比例
+                                        )
+            self._mask_function_name_for_log = "scatter_mask (Transformer class method)"
+        else:
+            print(f"Warning: Unknown mask_function '{mask_function}'. Defaulting to scatter_mask.")
+            self.mask_function_impl = lambda z_indices, p_hole_ratio: self.scatter_mask(
+                                            shape=z_indices.shape,
+                                            device=z_indices.device,
+                                            p=(1.0 - p_hole_ratio)
+                                        )
+            self._mask_function_name_for_log = "scatter_mask (defaulted)"
+        
+        print(f"Using mask function implementation: {self._mask_function_name_for_log}")
+
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -180,41 +275,57 @@ class Transformer(pl.LightningModule):
         mask = mask.to(dtype=torch.int64)
         return mask
 
-    def forward(self, x, c, mask=None):
+    def forward(self, x, c, mask=None, text_prompts=None): # <--- [修改] 增加 text_prompts 參數
         # one step to produce the logits
         _, z_indices = self.encode_to_z(x.float())
         _, c_indices = self.encode_to_c(c.float())
 
         # during training, we'll mask out some tokens (0.15 by default)
-        assert mask is not None or self.pkeep < 1.0 
-
-        if mask is None:
-            pkeep = self.mask_ratio_scheduler(x.shape[0])
-            mask = self.mask_function(z_indices, p=pkeep)
+        assert mask is not None or self.pkeep < 1.0 # 原始斷言
+        current_mask = mask # 使用一個新變數名以避免覆蓋參數 mask
+        if current_mask is None:
+            current_hole_ratio = self.mask_ratio_scheduler(x.shape[0]) 
+            current_mask = self.mask_function_impl(z_indices, p_hole_ratio=current_hole_ratio)
         else:
-            mask = self.preprocess_mask(mask, z_indices)
+            current_mask = self.preprocess_mask(current_mask, z_indices)
 
         # !!! replacing masked indices with the [MASK] token (a.k.a -1)
         r_indices = torch.full_like(z_indices, self.mask_token)
-        a_indices = mask*z_indices+(1-mask)*r_indices           
-        a_indices = a_indices + 1 # adding one to the indices as MASK token is set to -1
+        a_indices = current_mask * z_indices + (1 - current_mask) * r_indices           
+        a_indices = a_indices + 1 
 
         # from this point we are making predictions on tokens where MASK==0 
         cz_indices = torch.cat((c_indices, a_indices), dim=1)
         mask_c_indices = torch.full_like(c_indices, 1, dtype=torch.int64).to(mask.device)
-        mask_c = torch.cat([mask_c_indices, mask], dim=1)
+        mask_for_gpt_self_attn  = torch.cat([mask_c_indices, mask], dim=1)
 
+        # ==== [新增] 準備文字 context ====
+        text_context_features = None
+        if self.clip_model is not None and text_prompts is not None:
+            # 確保 clip_model 在正確的 device 上 (PyTorch Lightning 會處理 self.clip_model.to(self.device))
+            # print(f"Device of clip_model: {next(self.clip_model.parameters()).device}, text_prompts device (example): {x.device}")
+            with torch.no_grad():
+                # text_prompts 應該是一個 list of strings
+                text_tokens = clip.tokenize(text_prompts).to(self.device) # 確保 tokenize 在正確的 device
+                text_features = self.clip_model.encode_text(text_tokens).float() 
+            # CrossAttention 通常期望 context 是 (B, ContextSeqLen, ContextEmbedDim)
+            # 對於單個句子，ContextSeqLen 可以是 1
+            text_context_features = text_features.unsqueeze(1) # (B, 1, clip_dim)
+        # =================================
+
+        # ==== [修改] self.transformer 的調用，傳入 context ====
+        # mingpt.GPT 的 forward 方法簽名應為 forward(self, idx, context=None, ...)
         if self.attention_extent == 'mask':
-            logits, _ = self.transformer(cz_indices, mask=mask_c, autoregressive=False)
+            logits, _ = self.transformer(idx=cz_indices, mask=mask_for_gpt_self_attn, 
+                                         autoregressive=False, context=text_context_features)
         else:
-            logits, _ = self.transformer(cz_indices, mask=None, autoregressive=False)
+            logits, _ = self.transformer(idx=cz_indices, mask=None, 
+                                         autoregressive=False, context=text_context_features)
+        # ===================================================
 
-        # target includes all sequence elements (no need to handle first one
-        # differently because we are conditioning)
         target = z_indices
-        # cut off conditioning outputs (as well as the mask label)
-        logits = logits[:, c_indices.shape[1]:, 1:]
-        return logits, target, mask
+        logits = logits[:, c_indices.shape[1]:, 1:] # 原始邏輯：去除條件部分的 logits，並調整詞彙表
+        return logits, target, current_mask # 返回 current_mask
 
     def top_k_logits(self, logits, k):
         v, ix = torch.topk(logits, k)
@@ -223,7 +334,7 @@ class Transformer(pl.LightningModule):
         return out
 
     @torch.no_grad()
-    def sample(self, x, c, 
+    def sample(self, x, c, text_prompts_for_sampling=None, # <--- [新增] text_prompts_for_sampling 參數
                sampling_ratio=0.2, 
                temperature=1.0, 
                sample=True, 
@@ -243,6 +354,15 @@ class Transformer(pl.LightningModule):
 
         if not self.use_condGPT:
             x = torch.cat((c,x),dim=1)
+
+        # ==== [新增] 準備文字 context for sampling ====
+        text_context_features_sampling = None
+        if self.clip_model is not None and text_prompts_for_sampling is not None:
+            with torch.no_grad():
+                text_tokens = clip.tokenize(text_prompts_for_sampling).to(self.device)
+                text_features = self.clip_model.encode_text(text_tokens).float()
+            text_context_features_sampling = text_features.unsqueeze(1)
+        # =============================================
 
         block_size = self.transformer.get_block_size()
         assert not self.transformer.training
@@ -284,11 +404,17 @@ class Transformer(pl.LightningModule):
             # if self.use_condGPT:
             #     logits, _ = self.transformer(x_cond, c, mask=(1-mask_c.int()), autoregressive=False)
 
-            if self.attention_extent == 'mask':
-                logits, _ = self.transformer(x_cond, mask=(1-mask_c.int()), autoregressive=False)
-            else:
-                logits, _ = self.transformer(x_cond, mask=None, autoregressive=False)
+            # if self.attention_extent == 'mask':
+            #     logits, _ = self.transformer(x_cond, mask=(1-mask_c.int()), autoregressive=False)
+            # else:
+            #     logits, _ = self.transformer(x_cond, mask=None, autoregressive=False)
 
+            if self.attention_extent == 'mask':
+                logits, _ = self.transformer(idx=x_cond, mask=(1-mask_c.int()),  # <--- [修改] 傳入 context
+                                             autoregressive=False, context=text_context_features_sampling)
+            else:
+                logits, _ = self.transformer(idx=x_cond, mask=None,             # <--- [修改] 傳入 context
+                                             autoregressive=False, context=text_context_features_sampling)
             # pluck the logits at the final step and scale by temperature              
             logits = logits[:, c.shape[1]:, 1:] / t
 
@@ -395,7 +521,17 @@ class Transformer(pl.LightningModule):
         similar to log image, but return a single image tensor given the default mask function instead of logging results
 
         '''
-        x, c = self.get_xc(batch)
+        # x, c = self.get_xc(batch)
+
+        # ==== [修改] 獲取 text_prompts ====
+        xc_output = self.get_xc(batch)
+        if len(xc_output) == 3:
+            x, c, text_prompts = xc_output
+        else: # 向下兼容或沒有 text_prompt 的情況
+            x, c = xc_output
+            text_prompts = None
+        # ================================
+
         x = x.to(device=self.device).float()
         c = c.to(device=self.device).float()
         quant_z, z_indices = self.encode_to_z(x)
@@ -410,14 +546,28 @@ class Transformer(pl.LightningModule):
 
         r_indices = torch.full_like(z_indices, self.mask_token)
         z_start_indices = mask*z_indices+(1-mask)*r_indices      
-        index_sample = self.sample(z_start_indices, 
-                                   c_indices,
-                                   sample= not det)
+        # index_sample = self.sample(z_start_indices, 
+        #                            c_indices,
+        #                            sample= not det)
+        # ==== [修改] 調用 sample 時傳入 text_prompts ====
+        index_sample = self.sample(z_start_indices,  #
+                                   c_indices, #
+                                   text_prompts_for_sampling=text_prompts, # <--- 新增
+                                   sample= not det) #
+        # ===========================================
         return self.decode_to_img(index_sample, quant_z.shape, return_quant=return_quant)
 
     @torch.no_grad()
     def forward_to_indices(self, batch, z_indices, mask, det=False):
-        x, c = self.get_xc(batch)
+        # x, c = self.get_xc(batch)
+        # ==== [修改] 獲取 text_prompts ====
+        xc_output = self.get_xc(batch) #
+        if len(xc_output) == 3: #
+            x, c, text_prompts = xc_output #
+        else: #
+            x, c = xc_output #
+            text_prompts = None #
+        # ================================
         x = x.to(device=self.device).float()
         c = c.to(device=self.device).float()
        
@@ -428,9 +578,15 @@ class Transformer(pl.LightningModule):
         mask = self.preprocess_mask(mask, z_indices)
         r_indices = torch.full_like(z_indices, self.mask_token)
         z_start_indices = mask*z_indices+(1-mask)*r_indices      
-        index_sample = self.sample(z_start_indices.to(device=self.device), 
-                                   c_indices.to(device=self.device),
-                                   sample= not det)
+        # index_sample = self.sample(z_start_indices.to(device=self.device), 
+        #                            c_indices.to(device=self.device),
+        #                            sample= not det)
+        # ==== [修改] 調用 sample 時傳入 text_prompts ====
+        index_sample = self.sample(z_start_indices.to(device=self.device),  #
+                                   c_indices.to(device=self.device), #
+                                   text_prompts_for_sampling=text_prompts, # <--- 新增
+                                   sample= not det) #
+        # ===========================================
         return index_sample
 
 
@@ -438,7 +594,15 @@ class Transformer(pl.LightningModule):
     def log_images(self, batch, temperature=None, top_k=None, callback=None, lr_interface=False, composition=True, **kwargs):
         
         log = dict()
-        x, c = self.get_xc(batch)
+        # x, c = self.get_xc(batch)
+        # ==== [修改] 獲取 text_prompts ====
+        xc_output = self.get_xc(batch) #
+        if len(xc_output) == 3: #
+            x, c, text_prompts = xc_output #
+        else: #
+            x, c = xc_output #
+            text_prompts = None #
+        # ================================
         x = x.to(device=self.device).float()
         c = c.to(device=self.device).float()
 
@@ -468,10 +632,14 @@ class Transformer(pl.LightningModule):
         r_indices = torch.full_like(z_indices, self.mask_token)
         z_start_indices = mask*z_indices+(1-mask)*r_indices      
 
-        # using default sampling setting
-        index_sample = self.sample(z_start_indices, 
-                                   c_indices)
-
+        # # using default sampling setting
+        # index_sample = self.sample(z_start_indices, 
+        #                            c_indices)
+        # ==== [修改] 調用 sample 時傳入 text_prompts ====
+        index_sample = self.sample(z_start_indices,  #
+                                   c_indices, #
+                                   text_prompts_for_sampling=text_prompts) # <--- 新增
+        # ===========================================
         ####################
         # index_sample = z_indices * mask + (1-mask) * z_indices_gt
         #####################
@@ -487,15 +655,33 @@ class Transformer(pl.LightningModule):
         x_masked = image_mask * x
 
         # reconstruction
-        if self.mask_on_latent:
-            x_rec = self.decode_to_img(z_indices_recon, quant_z.shape)
-        else:
-            r_indices = torch.full_like(z_indices_recon, self.mask_token)
-            z_start_indices = mask*z_indices_recon+(1-mask)*r_indices      
-            index_sample = self.sample(z_start_indices, c_indices,
-                                       sample=False,
-                                       callback=callback if callback is not None else lambda k: None)
-            x_rec = self.decode_to_img(index_sample, quant_z.shape)
+        # if self.mask_on_latent:
+        #     x_rec = self.decode_to_img(z_indices_recon, quant_z.shape)
+        # else:
+        #     r_indices = torch.full_like(z_indices_recon, self.mask_token)
+        #     z_start_indices = mask*z_indices_recon+(1-mask)*r_indices      
+        #     index_sample = self.sample(z_start_indices, c_indices,
+        #                                sample=False,
+        #                                callback=callback if callback is not None else lambda k: None)
+        #     x_rec = self.decode_to_img(index_sample, quant_z.shape)
+        if self.mask_on_latent: #
+            x_rec = self.decode_to_img(z_indices_recon, quant_z.shape) #
+        else: #
+            r_indices_rec = torch.full_like(z_indices_recon, self.mask_token) #
+            z_start_indices_rec = mask*z_indices_recon+(1-mask)*r_indices_rec #     
+            index_sample_rec = self.sample(z_start_indices_rec, c_indices, # <--- [修改] 此處也可能需要 text_prompts
+                                           text_prompts_for_sampling=text_prompts, #
+                                           sample=False, #
+                                           callback=callback if callback is not None else lambda k: None) #
+            x_rec = self.decode_to_img(index_sample_rec, quant_z.shape) #
+
+        log["samples_det_gen"] = x_sample_det #
+        if composition: #
+            x_sample_det_comp = image_mask * x + (1 - image_mask) * x_sample_det #
+            if hasattr(self, 'second_stage_model') and self.second_stage_model is not None: # 確保 second_stage_model 存在
+                x_sample_det_comp = self.second_stage_model.refine(x_sample_det_comp, image_mask) #
+            log["samples_det"] = x_sample_det_comp #
+        log["inputs_masked"] = image_mask * x # 使用 image_mask 而不是 x_masked (如果 x_masked 未定義)
 
         # log["inputs"] = x
         # log["reconstructions"] = x_rec
@@ -539,18 +725,50 @@ class Transformer(pl.LightningModule):
             x = x.float()
         return x
 
-    def get_xc(self, batch, N=None):
-        x = self.get_input(self.first_stage_key, batch)
-        c = self.get_input(self.cond_stage_key, batch)
-        if N is not None:
-            x = x[:N]
-            c = c[:N]
-        return x, c
+    # def get_xc(self, batch, N=None):
+    #     x = self.get_input(self.first_stage_key, batch)
+    #     c = self.get_input(self.cond_stage_key, batch)
+    #     if N is not None:
+    #         x = x[:N]
+    #         c = c[:N]
+    #     return x, c
+
+    def get_xc(self, batch, N=None): #
+        x = self.get_input(self.first_stage_key, batch) #
+        c = self.get_input(self.cond_stage_key, batch) #
+        
+        # ==== [新增] 獲取 text_prompts ====
+        text_prompts = batch.get("text_prompt", None) # 從 batch 中獲取，如果沒有則為 None
+        # text_prompts 應該是一個字串列表，長度為 batch_size
+        # ===============================
+            
+        if N is not None: #
+            x = x[:N] #
+            c = c[:N] #
+            if text_prompts is not None: #
+                text_prompts = text_prompts[:N] #
+        
+        if text_prompts is not None: #
+            return x, c, text_prompts # 返回三元組 #
+        else: # 如果沒有 text_prompts，則返回原始的二元組，或者 x,c,None
+            return x, c, None #
 
     # loss function defined here
     def shared_step(self, batch, batch_idx):
-        x, c = self.get_xc(batch)
-        logits, target, mask = self(x, c)
+        # x, c = self.get_xc(batch)
+        # ==== [修改] 獲取 text_prompts ====
+        xc_output = self.get_xc(batch) #
+        if len(xc_output) == 3: #
+            x, c, text_prompts = xc_output #
+        else: #
+            x, c = xc_output #
+            text_prompts = None #
+        # ================================
+        # logits, target, mask = self(x, c) # 原有
+        # ==== [修改] 傳遞 text_prompts 給 forward ====
+        logits, target, mask = self(x, c, text_prompts=text_prompts) # <--- 新增傳遞
+        # ============================================
+
         B, L, N = logits.shape
         mask_reverse = (1 - mask).bool()
         target_select = torch.masked_select(target.reshape(-1), mask_reverse.reshape(-1))

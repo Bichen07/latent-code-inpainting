@@ -2,6 +2,7 @@ model:
   base_learning_rate: 4.5e-06
   target: core.models.transformer.Transformer
   params:
+    clip_model_name: "ViT-B/32"  # <--- [可選新增]
     # ckpt_path: ckpts/places256_transformer.ckpt
     cond_stage_key: segmentation
     attention_extent: mask
@@ -20,6 +21,8 @@ model:
         embd_pdrop: 0.1
         resid_pdrop: 0.1
         attn_pdrop: 0.1
+        context_dim: 512 # <--- 確保這個存在且值正確
+
     first_stage_config:
       target: core.models.vqgan.VQModel
       params:
@@ -52,10 +55,12 @@ data:
   target: train.DataModuleFromConfig
   params:
     batch_size: 1
+    num_workers: 4 # <--- 嘗試添加或調整這個值
     train:
       target: core.data.places365.Places
       params:
         dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
+        annotations_filepath: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/annotations/football_annotations_v1.csv # <--- 修改為您的 CSV 文件路徑
         crop_size: 256
         rescale: True
         rescale_size: 256
@@ -69,3 +74,13 @@ data:
         rescale: True
         rescale_size: 256
         split: 'test'
+
+lightning:
+  trainer:
+    # gpus: "0," # 您已經在命令列中通過 --gpus 0, 指定了，這裡可以不寫，或者保持一致
+    # max_epochs: 20 # 您也在命令列中通過 --trainer.max_epochs 20 指定了
+    accumulate_grad_batches: 4 # <--- 在這裡設置您想要的梯度累積步數
+    # distributed_backend: ddp # train.py 中有預設邏輯，這裡不寫通常也可以
+    # strategy: ddp # train.py 中有預設邏輯
+    # accelerator: gpu # train.py 中有預設邏輯
+    # devices: 1 # train.py 中有預設邏輯
