@@ -7,6 +7,7 @@ import random
 from train import instantiate_from_config
 from core.modules.util import SOSProvider, scatter_mask, box_mask, mixed_mask, RandomMask, BatchRandomMask
 import clip # <--- [新增] 導入 clip
+import time # 確保導入
 
 
 def disabled_train(self, mode=True):
@@ -68,15 +69,9 @@ class Transformer(pl.LightningModule):
         self.text_embedding_dim = None # 先設為 None
         try:
             print(f"Loading CLIP model: {clip_model_name}...")
-            # 我們需要將模型移動到 self.device，但此時 self.device 可能還未定義
-            # PyTorch Lightning 會自動處理模型到設備的移動，所以先載入到 CPU
             self.clip_model, _ = clip.load(clip_model_name, device="cpu") 
             self.clip_model.requires_grad_(False) # 凍結 CLIP 參數
             self.clip_model.eval()
-            # 獲取 CLIP text embedding 的維度
-            # 這取決於具體的 CLIP 模型，對於 ViT-B/32 是 512
-            # 可以通過 model.text_projection (如果存在) 或 model.ln_final (視覺部分) 的權重形狀推斷
-            # 或者直接使用已知值。一個通用的獲取方式是執行一次 encode_text
             dummy_text = clip.tokenize(["test"]).to("cpu")
             with torch.no_grad():
                 dummy_embedding = self.clip_model.encode_text(dummy_text)
@@ -136,10 +131,10 @@ class Transformer(pl.LightningModule):
             # p_from_scheduler 就是洞的比例 (hole_ratio)
             self.mask_function_impl = lambda z_indices, p_hole_ratio: torch.from_numpy(
                 BatchRandomMask(
-                    batch_size=z_indices.shape[0],
+                    batch_size=z_indices.shape[0], 
                     s=int(math.sqrt(z_indices.shape[-1])),
-                    hole_range=[p_hole_ratio, p_hole_ratio] 
-                )
+                    hole_range=[max(0.0, p_hole_ratio - 0.08), min(1.0, p_hole_ratio + 0.08)] 
+                ) # BatchRandomMask 應該已經返回 float32 numpy array
             ).to(z_indices.device).long()
             self._mask_function_name_for_log = "BatchRandomMask (from core.modules.util)"
 
@@ -276,45 +271,102 @@ class Transformer(pl.LightningModule):
         return mask
 
     def forward(self, x, c, mask=None, text_prompts=None): # <--- [修改] 增加 text_prompts 參數
+        current_op_time = time.time()
+        # print(f"--- [Transformer.forward DEBUG | {current_op_time:.2f}s] ---")
+        # print(f"    Input x: {x.shape}, c: {c.shape}, text_prompts: {text_prompts is not None}")
+
         # one step to produce the logits
         _, z_indices = self.encode_to_z(x.float())
-        _, c_indices = self.encode_to_c(c.float())
+        # print(f"    After encode_to_z: z_indices.shape={z_indices.shape}. Elapsed: {time.time() - current_op_time:.4f}s")
+        current_op_time = time.time()
 
-        # during training, we'll mask out some tokens (0.15 by default)
+        _, c_indices = self.encode_to_c(c.float())
+        # print(f"    After encode_to_c: c_indices.shape={c_indices.shape}. Elapsed: {time.time() - current_op_time:.4f}s")
+        current_op_time = time.time()
+
         assert mask is not None or self.pkeep < 1.0 # 原始斷言
-        current_mask = mask # 使用一個新變數名以避免覆蓋參數 mask
+        current_mask = mask 
         if current_mask is None:
             current_hole_ratio = self.mask_ratio_scheduler(x.shape[0]) 
-            current_mask = self.mask_function_impl(z_indices, p_hole_ratio=current_hole_ratio)
-        else:
-            current_mask = self.preprocess_mask(current_mask, z_indices)
+            
+            # ==== [DEBUG 打印] ====
+            # print(f"    Before self.mask_function_impl. Hole ratio: {current_hole_ratio}. z_indices shape: {z_indices.shape}. Time: {time.time() - current_op_time:.4f}s") # current_op_time 需要在這裡之前定義或傳遞
+            current_op_time_mask = time.time()
+            # =======================
+
+            current_mask_raw = self.mask_function_impl(z_indices, p_hole_ratio=current_hole_ratio)
+            
+            # ==== [DEBUG 打印 和 新增 Reshape] ====
+            # print(f"    After self.mask_function_impl. current_mask_raw shape: {current_mask_raw.shape}. Elapsed for mask_function_impl: {time.time() - current_op_time_mask:.4f}s")
+            
+            # current_mask_raw 的形狀可能是 (B, 1, H_latent, W_latent)，例如 (1, 1, 16, 16)
+            # z_indices 的形狀是 (B, H_latent * W_latent)，例如 (1, 256)
+            # 我們需要將 current_mask_raw reshape 成與 z_indices 一致的形狀
+            if current_mask_raw.ndim == 4 and current_mask_raw.shape[1] == 1: # (B, 1, H, W)
+                current_mask = current_mask_raw.reshape(current_mask_raw.shape[0], -1) # 變為 (B, H*W)
+            elif current_mask_raw.ndim == 3 and current_mask_raw.shape[0] == z_indices.shape[0]: # (B, H, W) 假設情況
+                 current_mask = current_mask_raw.reshape(current_mask_raw.shape[0], -1)
+            elif current_mask_raw.shape == z_indices.shape: # 如果形狀已經是 (B, H*W)
+                current_mask = current_mask_raw
+            else:
+                raise ValueError(f"Shape mismatch for current_mask_raw ({current_mask_raw.shape}) and z_indices ({z_indices.shape}) after mask_function_impl")
+            
+            # print(f"    After reshaping current_mask. current_mask shape: {current_mask.shape}")
+            # current_op_time = time.time() # 如果需要後續計時，在這裡重置
+            # =======================================
+        else: # 如果外部提供了 mask
+            # print(f"    Using provided mask. Before self.preprocess_mask. Input mask shape: {mask.shape}. z_indices shape: {z_indices.shape}.") # Time: ...
+            # current_op_time_mask_prep = time.time()
+            current_mask = self.preprocess_mask(mask, z_indices) # preprocess_mask 應該返回 (B, H*W)
+            # print(f"    After self.preprocess_mask. current_mask shape: {current_mask.shape}.") # Elapsed for preprocess_mask: ...
+            # current_op_time = time.time()
 
         # !!! replacing masked indices with the [MASK] token (a.k.a -1)
+        # print(f"    Before creating r_indices. current_mask.device: {current_mask.device}, z_indices.device: {z_indices.device}. Time: {time.time() - current_op_time:.4f}s")
+        current_op_time_r_indices = time.time()
         r_indices = torch.full_like(z_indices, self.mask_token)
         a_indices = current_mask * z_indices + (1 - current_mask) * r_indices           
         a_indices = a_indices + 1 
+        # print(f"    After creating a_indices. a_indices shape: {a_indices.shape}. Elapsed for r_a_indices: {time.time() - current_op_time_r_indices:.4f}s")
+        current_op_time = time.time()
 
         # from this point we are making predictions on tokens where MASK==0 
         cz_indices = torch.cat((c_indices, a_indices), dim=1)
-        mask_c_indices = torch.full_like(c_indices, 1, dtype=torch.int64).to(mask.device)
-        mask_for_gpt_self_attn  = torch.cat([mask_c_indices, mask], dim=1)
+        mask_c_indices = torch.full_like(c_indices, 1, dtype=torch.int64).to(c_indices.device) 
+
+        # ==== [這裡可能是卡頓點3：如果 mask_for_gpt_self_attn 的 mask 參數是 None，並且 current_mask 的 device 不對] ====
+        # print(f"    Before creating mask_for_gpt_self_attn. c_indices.shape: {c_indices.shape}, current_mask.shape: {current_mask.shape}. Time: {time.time() - current_op_time:.4f}s")
+        current_op_time_gpt_mask = time.time()
+        # mask_for_gpt_self_attn  = torch.cat([mask_c_indices, mask], dim=1) # 這是原始碼，可能有問題
+        mask_for_gpt_self_attn  = torch.cat([mask_c_indices, current_mask], dim=1) # <--- [建議修改] 使用 current_mask
+        # print(f"    After creating mask_for_gpt_self_attn. Shape: {mask_for_gpt_self_attn.shape}. Elapsed for gpt_mask: {time.time() - current_op_time_gpt_mask:.4f}s")
+        current_op_time = time.time()
 
         # ==== [新增] 準備文字 context ====
         text_context_features = None
         if self.clip_model is not None and text_prompts is not None:
-            # 確保 clip_model 在正確的 device 上 (PyTorch Lightning 會處理 self.clip_model.to(self.device))
-            # print(f"Device of clip_model: {next(self.clip_model.parameters()).device}, text_prompts device (example): {x.device}")
+            self.clip_model.to(self.device)
+            # print(f"    Before clip.tokenize. Time: {time.time() - current_op_time:.4f}s")
             with torch.no_grad():
-                # text_prompts 應該是一個 list of strings
-                text_tokens = clip.tokenize(text_prompts).to(self.device) # 確保 tokenize 在正確的 device
-                text_features = self.clip_model.encode_text(text_tokens).float() 
-            # CrossAttention 通常期望 context 是 (B, ContextSeqLen, ContextEmbedDim)
-            # 對於單個句子，ContextSeqLen 可以是 1
-            text_context_features = text_features.unsqueeze(1) # (B, 1, clip_dim)
+                text_tokens = clip.tokenize(text_prompts).to(self.device)
+                # print(f"    After clip.tokenize: text_tokens.shape={text_tokens.shape}. Time: {time.time() - current_op_time:.4f}s")
+                current_op_time_clip_enc = time.time() # 單獨計時 encode_text
+                text_features = self.clip_model.encode_text(text_tokens).float()
+                # print(f"    After clip_model.encode_text: text_features.shape={text_features.shape}. Elapsed for encode_text: {time.time() - current_op_time_clip_enc:.4f}s")
+            text_context_features = text_features.unsqueeze(1)
+        else:
+            print(f"    CLIP model or text_prompts not available. Time: {time.time() - current_op_time:.4f}s")
+        current_op_time = time.time()
         # =================================
+        # print(f"    Before calling self.transformer (mingpt.GPT): cz_indices.shape={cz_indices.shape}, text_context_features.shape={text_context_features.shape if text_context_features is not None else 'None'}. Time: {time.time() - current_op_time:.4f}s")
 
         # ==== [修改] self.transformer 的調用，傳入 context ====
-        # mingpt.GPT 的 forward 方法簽名應為 forward(self, idx, context=None, ...)
+        # print(f"[Transformer.forward DEBUG] cz_indices: shape={cz_indices.shape}, dtype={cz_indices.dtype}, device={cz_indices.device}")
+        # if text_context_features is not None:
+        #     print(f"[Transformer.forward DEBUG] text_context_features: shape={text_context_features.shape}, dtype={text_context_features.dtype}, device={text_context_features.device}")
+        # else:
+        #     print("[Transformer.forward DEBUG] text_context_features is None")
+
         if self.attention_extent == 'mask':
             logits, _ = self.transformer(idx=cz_indices, mask=mask_for_gpt_self_attn, 
                                          autoregressive=False, context=text_context_features)
@@ -322,6 +374,7 @@ class Transformer(pl.LightningModule):
             logits, _ = self.transformer(idx=cz_indices, mask=None, 
                                          autoregressive=False, context=text_context_features)
         # ===================================================
+        # print(f"    After calling self.transformer. Logits shape: {logits.shape}. Total time in Transformer.forward: {time.time() - float(str(current_op_time).split()[0]):.4f}s") # 這裡的計時可能不準確，因為 current_op_time 在之前被重置
 
         target = z_indices
         logits = logits[:, c_indices.shape[1]:, 1:] # 原始邏輯：去除條件部分的 logits，並調整詞彙表
@@ -733,25 +786,18 @@ class Transformer(pl.LightningModule):
     #         c = c[:N]
     #     return x, c
 
-    def get_xc(self, batch, N=None): #
-        x = self.get_input(self.first_stage_key, batch) #
-        c = self.get_input(self.cond_stage_key, batch) #
-        
-        # ==== [新增] 獲取 text_prompts ====
-        text_prompts = batch.get("text_prompt", None) # 從 batch 中獲取，如果沒有則為 None
-        # text_prompts 應該是一個字串列表，長度為 batch_size
-        # ===============================
-            
-        if N is not None: #
-            x = x[:N] #
-            c = c[:N] #
-            if text_prompts is not None: #
-                text_prompts = text_prompts[:N] #
-        
-        if text_prompts is not None: #
-            return x, c, text_prompts # 返回三元組 #
-        else: # 如果沒有 text_prompts，則返回原始的二元組，或者 x,c,None
-            return x, c, None #
+    def get_xc(self, batch, N=None):
+        x = self.get_input(self.first_stage_key, batch)
+        c = self.get_input(self.cond_stage_key, batch)
+        text_prompts = batch.get("text_prompt", None) # <--- 從 batch 獲取 text_prompt
+
+        if N is not None:
+            x = x[:N]
+            c = c[:N]
+            if text_prompts is not None:
+                text_prompts = text_prompts[:N]
+
+        return x, c, text_prompts # <--- 返回三元組
 
     # loss function defined here
     def shared_step(self, batch, batch_idx):
@@ -835,3 +881,15 @@ class Transformer(pl.LightningModule):
 
     def configure_optimizers(self):
         return self.configure_optimizers_with_lr(self.learning_rate)
+    
+    def test_step(self, batch, batch_idx):
+        # 與 validation_step 類似，或者根據您的測試需求進行修改
+        # 您可以選擇只記錄損失，或者也調用 log_images
+        loss = self.shared_step(batch, batch_idx)
+        self.log("test/loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+
+        # 如果想在測試時也生成圖像樣本 (可能比較耗時)
+        # if batch_idx == 0 and self.trainer.is_global_zero: # 只在第一個 batch 和主進程生成
+        #     self.log_images(batch, split="test")
+
+        return loss # 或者一個包含損失和其他指標的字典

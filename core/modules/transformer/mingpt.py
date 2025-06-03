@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import top_k_top_p_filtering
+import time # <--- [新增] 導入 time 模塊
 
 logger = logging.getLogger(__name__)
 
@@ -52,30 +53,58 @@ class CrossAttention(nn.Module):
         x: visual features (Query), shape (B, T_vis, C_vis) where C_vis = n_embd
         context: text features (Key, Value source), shape (B, T_txt, C_txt) where C_txt = context_dim
         """
+        # ==== [新增 DEBUG] ====
+        current_time = time.time()
+        print(f"--- [CrossAttention DEBUG | {current_time:.2f}s] ---")
+        print(f"    Input x (query_source): shape={x.shape}, dtype={x.dtype}, device={x.device}")
+        print(f"    Input context (kv_source): shape={context.shape}, dtype={context.dtype}, device={context.device}")
+        # =======================
+
         B_x, T_x, C_x = x.size()
         B_c, T_c, C_c = context.size()
+        print(f"[CrossAttention DEBUG] Input x: {x.shape}, context: {context.shape}")
 
         assert C_x == self.n_embd, f"Visual embedding dim {C_x} doesn't match n_embd {self.n_embd}"
         assert C_c == self.key_dim, f"Context embedding dim {C_c} doesn't match context_dim {self.key_dim}"
+
+        q_proj = self.query(x)
+        k_proj = self.key(context)
+        v_proj = self.value(context)
+        # ==== [新增 DEBUG] ====
+        print(f"    q_proj (after linear): shape={q_proj.shape}")
+        print(f"    k_proj (after linear): shape={k_proj.shape}")
+        print(f"    v_proj (after linear): shape={v_proj.shape}")
+        # =======================
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q = self.query(x).view(B_x, T_x, self.n_head, C_x // self.n_head).transpose(1, 2)  # (B_x, nh, T_x, hs)
         k = self.key(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
         v = self.value(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
+        # ==== [新增 DEBUG] ====
+        print(f"    q (multi-head): shape={q.shape}")
+        print(f"    k (multi-head): shape={k.shape}")
+        print(f"    v (multi-head): shape={v.shape}")
+        # =======================
 
-        # cross-attention; (B_x, nh, T_x, hs) x (B_c, nh, hs, T_c) -> (B_x, nh, T_x, T_c)
-        # (B_c should be same as B_x for batch processing)
+
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        
+        print(f"[CrossAttention DEBUG] att (scores): {att.shape}")
+
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         y = att @ v  # (B_x, nh, T_x, T_c) x (B_c, nh, T_c, hs) -> (B_x, nh, T_x, hs)
-        y = y.transpose(1, 2).contiguous().view(B_x, T_x, C_x) # re-assemble all head outputs side by side
+        # ==== [新增 DEBUG] ====
+        print(f"    y (after att @ v): shape={y.shape}")
+        # =======================
 
-        # output projection
+        y = y.transpose(1, 2).contiguous().view(B_x, T_x, C_x) # re-assemble all head outputs side by side
         y = self.resid_drop(self.proj(y))
+        # ==== [新增 DEBUG] ====
+        print(f"    Output y (final): shape={y.shape}")
+        print(f"--- [CrossAttention DEBUG] End forward. Elapsed: {time.time() - current_time:.4f}s ---")
+        # =======================
+
         return y
-# =============================
 
 class GPTConfig:
     """ base GPT config, params common to all GPT versions """
@@ -165,50 +194,51 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    """ an unassuming Transformer block """
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-
-        # ==== [新增] Cross-Attention 層及其 LayerNorm ====
-        self.ln_cross_attn_q = nn.LayerNorm(config.n_embd) # LayerNorm for the query (visual features)
-        # 假設 context_dim 也是 config 的一部分，或者 GPT 類會傳遞它
-        # 為了更清晰，我們讓 GPTConfig 包含 context_dim
-        self.cross_attn = CrossAttention(config, context_dim=config.context_dim if hasattr(config, 'context_dim') else None)
-        # ==============================================
-
-
+        self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd),
-            nn.GELU(),  # nice
+            nn.GELU(),
             nn.Linear(4 * config.n_embd, config.n_embd),
             nn.Dropout(config.resid_pdrop),
         )
 
+        # ==== [確保 self.use_cross_attention 總是被定義] ====
+        if hasattr(config, 'context_dim') and config.context_dim is not None:
+            self.use_cross_attention = True
+            self.ln_cross_attn_q = nn.LayerNorm(config.n_embd)
+            self.cross_attn = CrossAttention(config, context_dim=config.context_dim)
+        else:
+            self.use_cross_attention = False
+            self.cross_attn = None # 明確設為 None
+            self.ln_cross_attn_q = None # 明確設為 None
+        # =====================================================
+
+
     # <--- [修改] forward 方法增加 context 參數 ----
     def forward(self, x, context=None, autoregressive=True, layer_past=None, return_present=False, mask=None): 
-        # x: visual features
-        # context: text features (semantic context)
-
-        # Self-Attention part (remains mostly the same)
-        # TODO: check that training still works (原始 TODO)
-        if return_present: assert not self.training # 原始斷言
-        # layer past: tuple of length two with B, nh, T, hs (原始註釋)
-        
-        # --- Self-Attention for visual features ---
         attn_out, present = self.attn(self.ln1(x), autoregressive=autoregressive, layer_past=layer_past, mask=mask)
-        x = x + attn_out # Residual connection
+        x = x + attn_out # Residual connection for Self-Attention
 
-        # ==== [新增] Cross-Attention Part (if context is provided) ====
-        if context is not None:
-            # Visual features (x) attend to text features (context)
-            cross_attn_out = self.cross_attn(self.ln_cross_attn_q(x), context)
-            x = x + cross_attn_out # Residual connection
-        # ===========================================================
+        # ==== [修正後] 只有一段 Cross-Attention 邏輯 ====
+        if self.use_cross_attention and self.cross_attn is not None and context is not None:
+            block_identifier = f"Block_ID_{getattr(self, '_block_idx_for_debug', 'UNKNOWN')}" 
+            print(f"[{block_identifier} DEBUG] Before CrossAttn: x.shape={x.shape}, x.device={x.device}, context.shape={context.shape}, context.device={context.device}")
 
-        x = x + self.mlp(self.ln2(x))
+            ln_q_out = self.ln_cross_attn_q(x)
+            print(f"[{block_identifier} DEBUG] ln_cross_attn_q(x): shape={ln_q_out.shape}")
+
+            cross_attn_out = self.cross_attn(ln_q_out, context=context)
+
+            print(f"[{block_identifier} DEBUG] After CrossAttn: cross_attn_out.shape={cross_attn_out.shape}")
+            x = x + cross_attn_out # Residual connection for Cross-Attention
+        # ===================================================
+
+        x = x + self.mlp(self.ln2(x)) # MLP
+
         if layer_past is not None or return_present:
             return x, present
         return x
@@ -230,7 +260,14 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        # self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        # 在 mingpt.GPT.__init__ 中
+        self.blocks = nn.ModuleList()
+        for i in range(config.n_layer):
+            block = Block(config)
+            block._block_idx_for_debug = i # 給每個 block 一個索引
+            self.blocks.append(block)
+        
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -251,39 +288,25 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    # def forward(self, idx, embeddings=None, targets=None, mask=None, autoregressive=True):
-    #     # forward the GPT model
-    #     token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
-    #     if embeddings is not None: # prepend explicit embeddings
-    #         token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
-
-    #     t = token_embeddings.shape[1]
-    #     assert t <= self.block_size, "Cannot forward, model block size is exhausted."
-    #     position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
-
-    #     x = self.drop(token_embeddings + position_embeddings)
-    #     for idx, block in enumerate(self.blocks):
-    #         # if idx <= len(self.blocks) // 2:
-    #         x = block(x, autoregressive=autoregressive, mask=mask)
-
-    #     x = self.ln_f(x)
-    #     logits = self.head(x)
-
-    #     # if we are given some desired targets also calculate the loss
-    #     loss = None
-    #     if targets is not None:
-    #         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-    #     return logits, loss
-
     # <--- [修改] forward 方法增加 context 參數 ----
     def forward(self, idx, context=None, embeddings=None, targets=None, mask=None, autoregressive=True):
-        # idx: visual token indices
-        # context: text features (semantic context)
+        # idx: visual token indices (cz_indices from Transformer LightningModule)
+        # context: text features (semantic context from CLIP)
+        
+        # ==== [新增 DEBUG] ====
+        gpt_forward_start_time = time.time()
+        # print(f"--- [mingpt.GPT.forward DEBUG | {gpt_forward_start_time:.2f}s] ---")
+        # print(f"    Input idx (cz_indices): shape={idx.shape}, dtype={idx.dtype}, device={idx.device}")
+        # if context is not None:
+        #     print(f"    Input context (text_features): shape={context.shape}, dtype={context.dtype}, device={context.device}")
+        # else:
+        #     print(f"    Input context (text_features) is None.")
+        # if embeddings is not None:
+        #     print(f"    Input embeddings: shape={embeddings.shape}")
+        # # =======================
         
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
-        if embeddings is not None: # prepend explicit embeddings (原始邏輯，可能與我們的用法衝突或需要調整)
-                                   # 我們這裡的 context 是給 Cross-Attention 用的，不是直接拼接到 token_embeddings
+        if embeddings is not None: # prepend explicit embeddings (LCI 原始邏輯)
             token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
 
         t = token_embeddings.shape[1]
@@ -291,9 +314,26 @@ class GPT(nn.Module):
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
 
         x = self.drop(token_embeddings + position_embeddings)
+        
+        # ==== [新增 DEBUG] ====
+        # print(f"    After initial token+pos embeddings & drop: x.shape={x.shape}. Elapsed for init_emb: {time.time() - gpt_forward_start_time:.4f}s")
+        # =======================
+
+        block_loop_start_time = time.time()
         for block_idx, block in enumerate(self.blocks): # 使用 block_idx 以便調試
-            # <--- [修改] 將 context 傳遞給每個 block ----
+            # ==== [新增 DEBUG] ====
+            # block_internal_start_time = time.time() # 如果需要更細緻的 Block 內部計時
+            # print(f"    [GPT.forward DEBUG] Entering Block {block_idx} - Input x: shape={x.shape}") # 已在 Block.forward 內部打印
+            # =======================
+            
+            # 將 context 傳遞給每個 block
             x = block(x, context=context, autoregressive=autoregressive, mask=mask)
+            
+            # ==== [新增 DEBUG] ====
+            # print(f"    [GPT.forward DEBUG] Exited Block {block_idx}. Output x: shape={x.shape}. Elapsed for block: {time.time() - block_internal_start_time:.4f}s")
+            # =======================
+        
+        # print(f"    After all Blocks. Elapsed for block loop: {time.time() - block_loop_start_time:.4f}s")
 
         x = self.ln_f(x)
         logits = self.head(x)
@@ -301,7 +341,8 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
+        
+        # print(f"--- [mingpt.GPT.forward DEBUG] End. Total elapsed in GPT.forward: {time.time() - gpt_forward_start_time:.4f}s ---")
         return logits, loss
 
     def forward_with_past(self, idx, embeddings=None, targets=None, past=None, past_length=None):

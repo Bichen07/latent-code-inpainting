@@ -73,26 +73,55 @@ def RandomBrush(
 
 def RandomMask(s, hole_range=[0,1]):
     coef = min(hole_range[0] + hole_range[1], 1.0)
+    loop_count = 0 # 初始化循環計數器
     while True:
+        loop_count += 1
         mask = np.ones((s, s), np.uint8)
         def Fill(max_size):
             w, h = np.random.randint(max_size), np.random.randint(max_size)
             ww, hh = w // 2, h // 2
             x, y = np.random.randint(-ww, s - w + ww), np.random.randint(-hh, s - h + hh)
             mask[max(y, 0): min(y + h, s), max(x, 0): min(x + w, s)] = 0
-        def MultiFill(max_tries, max_size):
-            for _ in range(np.random.randint(max_tries)):
+        def MultiFill(max_tries_param , max_size):
+            num_fills = 0
+            if max_tries_param > 0: # 只有當 max_tries_param > 0 時才嘗試隨機次數
+                num_fills = np.random.randint(max_tries_param) # 從 [0, max_tries_param - 1] 中選擇
+            
+            for _ in range(num_fills):
                 Fill(max_size)
-        MultiFill(int(5 * coef), s // 2) # 3
-        MultiFill(int(3 * coef), s)      # 2
+        MultiFill(max(1, int(5 * coef)), s // 2) 
+        MultiFill(max(1, int(3 * coef)), s)      
         mask = np.logical_and(mask, 1 - RandomBrush(int(9 * coef), s))  # hole denoted as 0, reserved as 1 # 4
-        hole_ratio = 1 - np.mean(mask)
-        if hole_range is not None and (hole_ratio <= hole_range[0] or hole_ratio >= hole_range[1]):
+        current_hole_ratio = 1 - np.mean(mask)
+
+        # ==== [新增 DEBUG 打印] ====
+        # if loop_count % 10 == 0 or loop_count == 1: # 每10次或第1次打印
+            # print(f"[RandomMask DEBUG] Loop: {loop_count}, Current hole_ratio: {current_hole_ratio:.4f}, Target hole_range: {hole_range}")
+        if loop_count > 500: # 添加一個最大循環次數以防止無限循環卡死整個程序
+            # print(f"[RandomMask DEBUG] Exceeded max loops (500). Returning current mask anyway.")
+            # 確保這裡返回的 mask 也是 float32 並且有正確的 newaxis
+            return mask[np.newaxis, ...].astype(np.float32) # <--- 強制 break 時也確保類型和維度
+        # ==== [新增 DEBUG 打印結束] ====
+        if hole_range is not None and \
+        (current_hole_ratio < hole_range[0] or current_hole_ratio > hole_range[1]): # <--- 注意這裡的條件，之前是 <= 和 >=
             continue
-        return mask[np.newaxis, ...].astype(np.float32)
+
+        return mask[np.newaxis, ...].astype(np.float32) # 原始碼返回 float32，我們在 transformer.py 中轉 long
 
 def BatchRandomMask(batch_size, s, hole_range=[0, 1]):
-    return np.stack([RandomMask(s, hole_range=hole_range) for _ in range(batch_size)], axis=0)
+    # 原始返回：
+    # return np.stack([RandomMask(s, hole_range=hole_range) for _ in range(batch_size)], axis=0)
+
+    # 修改後的返回，增加 .astype(np.float32) 或 .astype(np.uint8)
+    masks = [RandomMask(s, hole_range=hole_range) for _ in range(batch_size)]
+    # 在 stack 之前，可以打印一下 masks 列表中每個元素的 dtype 和 shape，看是否有問題
+    # for i, m in enumerate(masks):
+    #     print(f"[BatchRandomMask DEBUG] mask {i} shape: {m.shape}, dtype: {m.dtype}")
+
+    stacked_masks = np.stack(masks, axis=0)
+    # print(f"[BatchRandomMask DEBUG] stacked_masks shape: {stacked_masks.shape}, dtype: {stacked_masks.dtype}")
+
+    return stacked_masks.astype(np.float32) # 或者 np.uint8，因為 mask 最終是 0 和 1
 
 def scatter_mask(shape, device, p):
     p = (1 - p)

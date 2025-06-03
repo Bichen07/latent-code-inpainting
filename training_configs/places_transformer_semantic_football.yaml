@@ -69,7 +69,7 @@ data:
       target: core.data.places365.Places
       params:
         dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
-        maskroot: /home/chenh/data/masks_val_512_eval
+        # maskroot: /home/chenh/data/masks_val_512_eval
         crop_size: 256
         rescale: True
         rescale_size: 256
@@ -77,10 +77,12 @@ data:
 
 lightning:
   trainer:
-    # gpus: "0," # 您已經在命令列中通過 --gpus 0, 指定了，這裡可以不寫，或者保持一致
-    # max_epochs: 20 # 您也在命令列中通過 --trainer.max_epochs 20 指定了
-    accumulate_grad_batches: 4 # <--- 在這裡設置您想要的梯度累積步數
-    # distributed_backend: ddp # train.py 中有預設邏輯，這裡不寫通常也可以
-    # strategy: ddp # train.py 中有預設邏輯
-    # accelerator: gpu # train.py 中有預設邏輯
-    # devices: 1 # train.py 中有預設邏輯
+    gpus: "0,"  # 或者根據您的情況設置，也可以在命令列覆蓋
+    accelerator: gpu
+    # strategy: ddp # 或者 "auto" 讓 Lightning 自動選擇單 GPU 策略
+    # devices: 1 # 通常由 gpus 參數推斷
+    max_epochs: 30 # 您期望的 dryrun epoch 數
+    # limit_train_batches: 10 # 您期望的 dryrun 訓練批次數
+    # limit_val_batches: 2  # 您期望的 dryrun 驗證批次數
+    accumulate_grad_batches: 4 # 梯度累積步數
+    # distributed_backend: ddp # 通常 Lightning 會自動選擇

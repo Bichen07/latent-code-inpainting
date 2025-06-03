@@ -184,6 +184,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
+        # print(f"DEBUG: DataLoader num_workers: {self.num_workers}") # <--- 新增打印
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=True, collate_fn=custom_collate)
 
