@@ -55,7 +55,7 @@ data:
     train:
       target: core.data.places365.Places
       params:
-        dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
+        dataroot: ./dataset/ 
         crop_size: 256
         rescale: True
         rescale_size: 256
@@ -63,7 +63,7 @@ data:
     test:
       target: core.data.places365.Places
       params:
-        dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
+        dataroot: ./dataset/val/
         maskroot: /home/chenh/data/masks_val_512_eval
         crop_size: 256
         rescale: True

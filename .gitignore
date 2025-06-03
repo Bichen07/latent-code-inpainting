@@ -1,6 +1,8 @@
 *.ckpt
 logs/
 dataset/
+# Ignore output results folder
+my_inpainting_results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

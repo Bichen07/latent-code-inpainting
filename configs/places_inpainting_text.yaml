@@ -1,0 +1,167 @@
+model:
+  base_learning_rate: 4.5e-06
+  target: core.models.inpainting_master.InpaintingMaster
+  params:
+    stage: final # vq | encoder | decoder | transformer | final
+    encoder_choice: refined # vq | refined
+    image_key: image
+    ################# VQ model configuration ##########
+    vqmodel_config:
+      target: core.models.vqgan.VQModel
+      params:
+        ckpt_path: ckpts/places256_vqgan1024_BASE.ckpt
+        embed_dim: 256
+        n_embed: 1024
+        ddconfig:
+          padding_free: false
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 16
+          dropout: 0.0
+        lossconfig:
+          target: core.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+          params:
+            disc_conditional: False
+            disc_in_channels: 3
+            disc_start: 1
+            disc_weight: 0.8
+            codebook_weight: 1.0
+    ################## Encoder configuration #########################3
+    encoder_config:
+      target: core.models.encoder.MaskPartialEncoderModel
+      params:
+        ckpt_path: ckpts/encoder.ckpt
+        embed_dim: 256
+        n_embed: 1024
+        image_key: "image"
+        ddconfig:
+          clamp_ratio: 0.5
+          padding_free: false
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 16
+          dropout: 0.0
+    ################## Decoder configuration #########################3
+    decoder_config:
+      target: core.models.decoder.decoder.PartialDecoder
+      params:
+        ckpt_path: ckpts/places256_decoder.ckpt
+        embed_dim: 256
+        n_embed: 1024
+        image_key: image
+        restriction: false
+        ddconfig:
+          padding_free: false
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 16
+          dropout: 0.0
+        lossconfig:
+          target: core.modules.losses.vqperceptual.PIPSWithDiscriminator
+          params:
+            pixelloss_weight: 1.0
+            perceptual_weight: 1.0
+            r1_weight: 0.0
+            disc_conditional: false
+            disc_in_channels: 4
+            disc_start: 1
+            disc_weight: 0.8
+    ################## UNet Refinement configuration #####################
+    unet_config:
+      target: core.models.decoder.unet.RefinementUNet
+      params:
+        ckpt_path: ckpts/unet_256.ckpt
+        embed_dim: 256
+        n_embed: 1024
+        image_key: image
+        freeze_firststage: true
+        ddconfig:
+          padding_free: false
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 64
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 16
+          dropout: 0.0
+    ################## Transformer configuration #########################
+    transformer_config:
+      target: core.models.transformer.Transformer # <-- 確保這裡指向您的自定義 Transformer
+      params:
+        clip_model_name: "ViT-B/32" # <-- 新增：指定 CLIP 模型
+        ckpt_path: ckpts/transformer_text.ckpt # <-- 修改：指向您的帶文本檢查點
+        cond_stage_key: segmentation # 保持為 segmentation 或其他，但實際將使用文本
+        attention_extent: mask
+        mask_on_latent: false
+        transformer_config:
+          target: core.modules.transformer.mingpt.GPT
+          params:
+            vocab_size: 1025
+            block_size: 257  
+            n_layer: 12
+            n_head: 8
+            n_embd: 768
+            embd_pdrop: 0.1
+            resid_pdrop: 0.1
+            attn_pdrop: 0.1
+            context_dim: 512 # <-- 確保這個值與 CLIP 的文本 embedding 維度匹配
+        cond_stage_config: "__is_unconditional__" # 這裡雖然是 unconditional，但 Transformer 會檢查 text_prompt
+
+data:
+  target: train.DataModuleFromConfig
+  params:
+    batch_size: 4
+    test:
+      target: core.data.places365.Places
+      params:
+        dataroot: /home/chenh/data/val_large
+        maskroot: /home/chenh/data/masks_val_512_eval
+        crop_size: 256
+        rescale: True
+        rescale_size: 256
+        split: 'test'

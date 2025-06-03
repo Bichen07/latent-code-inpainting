@@ -42,12 +42,12 @@ model:
     encoder_config:
       target: core.models.encoder.MaskPartialEncoderModel
       params:
-        ckpt_path: ckpts/places256_partialencoder.ckpt
+        ckpt_path: ckpts/encoder.ckpt
         embed_dim: 256
         n_embed: 1024
         image_key: "image"
         ddconfig:
-          clamp_ratio: 0.25
+          clamp_ratio: 0.5
           padding_free: false
           double_z: false
           z_channels: 256
@@ -106,7 +106,7 @@ model:
     unet_config:
       target: core.models.decoder.unet.RefinementUNet
       params:
-        ckpt_path: ckpts/places256_unet.ckpt
+        ckpt_path: ckpts/unet_256.ckpt
         embed_dim: 256
         n_embed: 1024
         image_key: image
@@ -118,7 +118,7 @@ model:
           resolution: 256
           in_channels: 3
           out_ch: 3
-          ch: 128
+          ch: 64
           ch_mult:
           - 1
           - 1
@@ -133,7 +133,7 @@ model:
     transformer_config:
       target: core.models.transformer.Transformer
       params:
-        ckpt_path: ckpts/places256_transformer.ckpt
+        ckpt_path: ckpts/transformer.ckpt
         cond_stage_key: segmentation
         attention_extent: mask
         mask_on_latent: false
@@ -142,12 +142,12 @@ model:
           params:
             vocab_size: 1025
             block_size: 257  
-            n_layer: 40 # 24,40
-            n_head: 16
-            n_embd: 1408
-            embd_pdrop: 0.0
-            resid_pdrop: 0.0
-            attn_pdrop: 0.0
+            n_layer: 12 # 24,40
+            n_head: 8
+            n_embd: 768
+            embd_pdrop: 0.1
+            resid_pdrop: 0.1
+            attn_pdrop: 0.1
         cond_stage_config: "__is_unconditional__"
 data:
   target: train.DataModuleFromConfig
