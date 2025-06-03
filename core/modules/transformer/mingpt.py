@@ -53,12 +53,7 @@ class CrossAttention(nn.Module):
         x: visual features (Query), shape (B, T_vis, C_vis) where C_vis = n_embd
         context: text features (Key, Value source), shape (B, T_txt, C_txt) where C_txt = context_dim
         """
-        # ==== [新增 DEBUG] ====
         current_time = time.time()
-        print(f"--- [CrossAttention DEBUG | {current_time:.2f}s] ---")
-        print(f"    Input x (query_source): shape={x.shape}, dtype={x.dtype}, device={x.device}")
-        print(f"    Input context (kv_source): shape={context.shape}, dtype={context.dtype}, device={context.device}")
-        # =======================
 
         B_x, T_x, C_x = x.size()
         B_c, T_c, C_c = context.size()
@@ -70,40 +65,52 @@ class CrossAttention(nn.Module):
         q_proj = self.query(x)
         k_proj = self.key(context)
         v_proj = self.value(context)
-        # ==== [新增 DEBUG] ====
-        print(f"    q_proj (after linear): shape={q_proj.shape}")
-        print(f"    k_proj (after linear): shape={k_proj.shape}")
-        print(f"    v_proj (after linear): shape={v_proj.shape}")
-        # =======================
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q = self.query(x).view(B_x, T_x, self.n_head, C_x // self.n_head).transpose(1, 2)  # (B_x, nh, T_x, hs)
         k = self.key(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
         v = self.value(context).view(B_c, T_c, self.n_head, C_x // self.n_head).transpose(1, 2) # (B_c, nh, T_c, hs)
-        # ==== [新增 DEBUG] ====
-        print(f"    q (multi-head): shape={q.shape}")
-        print(f"    k (multi-head): shape={k.shape}")
-        print(f"    v (multi-head): shape={v.shape}")
-        # =======================
-
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        print(f"[CrossAttention DEBUG] att (scores): {att.shape}")
+
+        # ==== [修改 DEBUG] 只在檢測到 NaN/Inf 時打印詳細信息 ====
+        if torch.isnan(att).any() or torch.isinf(att).any():
+            print(f"[CrossAttention DEBUG] WARNING: NaN or Inf in 'att' scores BEFORE softmax!")
+            print(f"    Input x stats: min={x.min():.2e}, max={x.max():.2e}, mean={x.mean():.2e}, has_nan={torch.isnan(x).any()}")
+            print(f"    Input context stats: min={context.min():.2e}, max={context.max():.2e}, mean={context.mean():.2e}, has_nan={torch.isnan(context).any()}")
+            print(f"    q_proj stats: min={q_proj.min():.2e}, max={q_proj.max():.2e}, mean={q_proj.mean():.2e}")
+            print(f"    k_proj stats: min={k_proj.min():.2e}, max={k_proj.max():.2e}, mean={k_proj.mean():.2e}")
+            print(f"    att (scores) sample [0,0,0,:5]: {att[0,0,0,:5]}") # 打印一小部分有問題的分數
+            # att = torch.nan_to_num(att, nan=0.0, posinf=1e4, neginf=-1e4) # 保持 nan_to_num 處理
+        # else: # 如果正常，可以選擇不打印或只打印簡略信息
+            # print(f"[CrossAttention DEBUG] att scores shape: {att.shape}") # 例如，只打印形狀
+            pass # 正常情況下不打印詳細的 att
+        # ==== [新增 DEBUG] ====
+        if torch.isnan(att).any(): # 檢查 softmax 之後是否還有 NaN
+            print("[CrossAttention DEBUG] WARNING: NaN in attention probabilities AFTER softmax!")
+        # =======================
+
+        # 仍然建議保留 nan_to_num 以增強穩定性，即使我們期望它不被觸發
+        att = torch.nan_to_num(att, nan=0.0, posinf=1e4, neginf=-1e4) 
+        # =====================================================
 
         att = F.softmax(att, dim=-1)
+        if torch.isnan(att).any() or torch.isinf(att).any(): # 檢查 softmax 之後
+            print(f"[CrossAttention DEBUG] WARNING: NaN or Inf in 'att' probabilities AFTER softmax!")
+        
         att = self.attn_drop(att)
-        y = att @ v  # (B_x, nh, T_x, T_c) x (B_c, nh, T_c, hs) -> (B_x, nh, T_x, hs)
-        # ==== [新增 DEBUG] ====
-        print(f"    y (after att @ v): shape={y.shape}")
-        # =======================
+        y = att @ v
+        
+        y = y.transpose(1, 2).contiguous().view(B_x, T_x, C_x)
+        y_proj = self.proj(y)
+        y = self.resid_drop(y_proj)
 
-        y = y.transpose(1, 2).contiguous().view(B_x, T_x, C_x) # re-assemble all head outputs side by side
-        y = self.resid_drop(self.proj(y))
-        # ==== [新增 DEBUG] ====
-        print(f"    Output y (final): shape={y.shape}")
-        print(f"--- [CrossAttention DEBUG] End forward. Elapsed: {time.time() - current_time:.4f}s ---")
-        # =======================
+        if torch.isnan(y).any() or torch.isinf(y).any():
+            print(f"[CrossAttention DEBUG] WARNING: NaN or Inf in final output 'y'!")
+            print(f"    y_proj stats: min={y_proj.min():.2e}, max={y_proj.max():.2e}, mean={y_proj.mean():.2e}")
+            print(f"    final y stats: min={y.min():.2e}, max={y.max():.2e}, mean={y.mean():.2e}")
 
+        # print(f"--- [CrossAttention DEBUG] End forward. Elapsed: {time.time() - current_time_ca:.4f}s ---") # 可以註解掉耗時打印
         return y
 
 class GPTConfig:
@@ -220,25 +227,32 @@ class Block(nn.Module):
 
     # <--- [修改] forward 方法增加 context 參數 ----
     def forward(self, x, context=None, autoregressive=True, layer_past=None, return_present=False, mask=None): 
+        
+        block_identifier = f"Block_ID_{getattr(self, '_block_idx_for_debug', 'UNKNOWN')}"
+
         attn_out, present = self.attn(self.ln1(x), autoregressive=autoregressive, layer_past=layer_past, mask=mask)
         x = x + attn_out # Residual connection for Self-Attention
 
-        # ==== [修正後] 只有一段 Cross-Attention 邏輯 ====
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"[{block_identifier} DEBUG] WARNING: NaN/Inf after Self-Attention! x shape: {x.shape}")
+            # return x, present # 考慮是否要提前返回或拋出錯誤
+
         if self.use_cross_attention and self.cross_attn is not None and context is not None:
-            block_identifier = f"Block_ID_{getattr(self, '_block_idx_for_debug', 'UNKNOWN')}" 
-            print(f"[{block_identifier} DEBUG] Before CrossAttn: x.shape={x.shape}, x.device={x.device}, context.shape={context.shape}, context.device={context.device}")
-
+            # print(f"[{block_identifier} DEBUG] Before CrossAttn: x.shape={x.shape}, context.shape={context.shape}") # 減少打印
             ln_q_out = self.ln_cross_attn_q(x)
-            print(f"[{block_identifier} DEBUG] ln_cross_attn_q(x): shape={ln_q_out.shape}")
-
             cross_attn_out = self.cross_attn(ln_q_out, context=context)
-
-            print(f"[{block_identifier} DEBUG] After CrossAttn: cross_attn_out.shape={cross_attn_out.shape}")
-            x = x + cross_attn_out # Residual connection for Cross-Attention
-        # ===================================================
-
-        x = x + self.mlp(self.ln2(x)) # MLP
-
+            x = x + cross_attn_out
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"[{block_identifier} DEBUG] WARNING: NaN/Inf after Cross-Attention! x shape: {x.shape}")
+        
+        mlp_processed_x = self.mlp(self.ln2(x)) # 先計算 MLP 的輸出
+        if torch.isnan(mlp_processed_x).any() or torch.isinf(mlp_processed_x).any():
+            print(f"[{block_identifier} DEBUG] WARNING: NaN/Inf from MLP output! mlp_out shape: {mlp_processed_x.shape}")
+        x = x + mlp_processed_x
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"[{block_identifier} DEBUG] WARNING: NaN/Inf after MLP! x shape: {x.shape}")
+            
+        # print(f"--- [{block_identifier} DEBUG] End --- x_out shape: {x.shape} ---") # 減少打印頻率
         if layer_past is not None or return_present:
             return x, present
         return x

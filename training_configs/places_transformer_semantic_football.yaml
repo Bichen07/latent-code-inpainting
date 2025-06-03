@@ -60,7 +60,7 @@ data:
       target: core.data.places365.Places
       params:
         dataroot: ./dataset/ 
-        annotations_filepath: ./annotations/football_annotations_v1.csv # <--- 修改為您的 CSV 文件路徑
+        annotations_filepath: ./annotations/generated_annotations.csv # <--- 修改為您的 CSV 文件路徑
         crop_size: 256
         rescale: True
         rescale_size: 256
@@ -69,7 +69,7 @@ data:
       target: core.data.places365.Places
       params:
         dataroot: ./dataset/
-        annotations_filepath: ./annotations/football_annotations_v1.csv # <--- 測試/驗證集也需要標註文件
+        annotations_filepath: ./annotations/generated_annotations.csv # <--- 測試/驗證集也需要標註文件
         # maskroot: /home/chenh/data/masks_val_512_eval
         crop_size: 256
         rescale: True
@@ -80,10 +80,11 @@ lightning:
   trainer:
     gpus: "0,"  # 或者根據您的情況設置，也可以在命令列覆蓋
     accelerator: gpu
+    gradient_clip_val: 1.0
     # strategy: ddp # 或者 "auto" 讓 Lightning 自動選擇單 GPU 策略
     # devices: 1 # 通常由 gpus 參數推斷
     max_epochs: 20 # 您期望的 dryrun epoch 數
-    limit_train_batches: 10 # 您期望的 dryrun 訓練批次數
-    limit_val_batches: 2  # 您期望的 dryrun 驗證批次數
+    # limit_train_batches: 10 # 您期望的 dryrun 訓練批次數
+    # limit_val_batches: 2  # 您期望的 dryrun 驗證批次數
     accumulate_grad_batches: 4 # 梯度累積步數
     # distributed_backend: ddp # 通常 Lightning 會自動選擇
