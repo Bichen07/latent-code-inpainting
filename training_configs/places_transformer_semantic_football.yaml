@@ -26,7 +26,7 @@ model:
     first_stage_config:
       target: core.models.vqgan.VQModel
       params:
-        ckpt_path: ckpts/places256_vqgan1024_BASE.ckpt
+        ckpt_path: ./ckpts/places256_vqgan1024_BASE.ckpt
         embed_dim: 256
         n_embed: 1024
         ddconfig:
@@ -59,8 +59,8 @@ data:
     train:
       target: core.data.places365.Places
       params:
-        dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
-        annotations_filepath: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/annotations/football_annotations_v1.csv # <--- 修改為您的 CSV 文件路徑
+        dataroot: ./dataset/ 
+        annotations_filepath: ./annotations/football_annotations_v1.csv # <--- 修改為您的 CSV 文件路徑
         crop_size: 256
         rescale: True
         rescale_size: 256
@@ -68,7 +68,8 @@ data:
     test:
       target: core.data.places365.Places
       params:
-        dataroot: /home/carlos11/Downloads/code/SecondSemester/DLP/final/latent-code-inpainting/dataset/
+        dataroot: ./dataset/
+        annotations_filepath: ./annotations/football_annotations_v1.csv # <--- 測試/驗證集也需要標註文件
         # maskroot: /home/chenh/data/masks_val_512_eval
         crop_size: 256
         rescale: True
