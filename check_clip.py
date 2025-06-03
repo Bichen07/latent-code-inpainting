@@ -49,22 +49,14 @@ if __name__ == '__main__':
     # Keep them relatively simple and distinct for a start.
     suggested_keywords = [
         "football field",       # 足球場
-        "soccer field",         # 足球場 (同義詞，有助於 CLIP 理解)
         "green grass",          # 綠色草地
-        "goal post",            # 球門柱
         "stadium",              # 體育場，球場
         "player",               # 球員 (單數)
         "players",              # 球員 (複數)
-        "team",                 # 球隊
         "audience",             # 觀眾 (通常指特定場合的聽眾/觀眾)
-        "crowd",                #人群，觀眾群 (通常指大量聚集的人)
         "soccer ball",          # 足球
         "football",             # 足球 (可以指運動本身或球)
-        "game",                 # 比賽，遊戲
-        "action shot",          # 動態瞬間照片，動作鏡頭
         "empty field",          # 空曠的場地
-        "night game",           # 夜間比賽
-        "day game",             # 日間比賽
         "sports arena",         # 體育館，運動場地
         "jersey",               # 球衣
         "scoreboard",           # 計分板

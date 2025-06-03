@@ -1,6 +1,6 @@
 image_path,text_prompt
-./dataset/00000001.jpg,football field
-./dataset/00000002.jpg,football field
+./dataset/00000001.jpg,"four players in football field"
+./dataset/00000002.jpg,"players in football field"
 ./dataset/00000003.jpg,football field
 ./dataset/00000004.jpg,football field
 ./dataset/00000005.jpg,football field

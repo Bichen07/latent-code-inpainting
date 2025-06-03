@@ -81,8 +81,8 @@ lightning:
     accelerator: gpu
     # strategy: ddp # 或者 "auto" 讓 Lightning 自動選擇單 GPU 策略
     # devices: 1 # 通常由 gpus 參數推斷
-    max_epochs: 30 # 您期望的 dryrun epoch 數
-    # limit_train_batches: 10 # 您期望的 dryrun 訓練批次數
-    # limit_val_batches: 2  # 您期望的 dryrun 驗證批次數
+    max_epochs: 20 # 您期望的 dryrun epoch 數
+    limit_train_batches: 10 # 您期望的 dryrun 訓練批次數
+    limit_val_batches: 2  # 您期望的 dryrun 驗證批次數
     accumulate_grad_batches: 4 # 梯度累積步數
     # distributed_backend: ddp # 通常 Lightning 會自動選擇
